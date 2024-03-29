@@ -8,12 +8,14 @@ import numpy as np
 
 from supervision.config import CLASS_NAME_DATA_FIELD, ORIENTED_BOX_COORDINATES
 from supervision.detection.utils import (
+    box_non_max_suppression,
     calculate_masks_centroids,
     extract_ultralytics_masks,
     get_data_item,
     is_data_equal,
+    mask_non_max_suppression,
+    mask_to_xyxy,
     merge_data,
-    non_max_suppression,
     process_roboflow_result,
     validate_detections_fields,
     xywh_to_xyxy,
@@ -389,17 +391,52 @@ class Detections:
     @classmethod
     def from_transformers(cls, transformers_results: dict) -> Detections:
         """
-        Creates a Detections instance from object detection
+        Creates a Detections instance from object detection or segmentation
         [transformer](https://github.com/huggingface/transformers) inference result.
 
         Returns:
             Detections: A new Detections object.
-        """
 
+        Example:
+            ```python
+            import torch
+            import supervision as sv
+            from PIL import Image
+            from transformers import DetrImageProcessor, DetrForObjectDetection
+
+            processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
+            model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
+
+            image = Image.open(<SOURCE_IMAGE_PATH>)
+            inputs = processor(images=image, return_tensors="pt")
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+
+            width, height = image.size
+            target_size = torch.tensor([[height, width]])
+            results = processor.post_process_object_detection(
+                outputs=outputs, target_sizes=target_size)[0]
+            detections = sv.Detections.from_transformers(results)
+            ```
+        """  # noqa: E501 // docs
+
+        if "boxes" in transformers_results:
+            return cls(
+                xyxy=transformers_results["boxes"].cpu().detach().numpy(),
+                confidence=transformers_results["scores"].cpu().detach().numpy(),
+                class_id=transformers_results["labels"]
+                .cpu()
+                .detach()
+                .numpy()
+                .astype(int),
+            )
+        masks = transformers_results["masks"].cpu().detach().numpy().astype(bool)
         return cls(
-            xyxy=transformers_results["boxes"].cpu().numpy(),
-            confidence=transformers_results["scores"].cpu().numpy(),
-            class_id=transformers_results["labels"].cpu().numpy().astype(int),
+            xyxy=mask_to_xyxy(masks),
+            mask=masks,
+            confidence=transformers_results["scores"].cpu().detach().numpy(),
+            class_id=transformers_results["labels"].cpu().detach().numpy().astype(int),
         )
 
     @classmethod
@@ -486,7 +523,9 @@ class Detections:
         )
 
         if np.asarray(xyxy).shape[0] == 0:
-            return cls.empty()
+            empty_detection = cls.empty()
+            empty_detection.data = {CLASS_NAME_DATA_FIELD: np.empty(0)}
+            return empty_detection
 
         return cls(
             xyxy=xyxy,
@@ -1001,7 +1040,8 @@ class Detections:
         self, threshold: float = 0.5, class_agnostic: bool = False
     ) -> Detections:
         """
-        Perform non-maximum suppression on the current set of object detections.
+        Performs non-max suppression on detection set. If the detections result
+        from a segmentation model, the IoU mask is applied. Otherwise, box IoU is used.
 
         Args:
             threshold (float, optional): The intersection-over-union threshold
@@ -1028,18 +1068,26 @@ class Detections:
 
         if class_agnostic:
             predictions = np.hstack((self.xyxy, self.confidence.reshape(-1, 1)))
-            indices = non_max_suppression(
+        else:
+            assert self.class_id is not None, (
+                "Detections class_id must be given for NMS to be executed. If you"
+                " intended to perform class agnostic NMS set class_agnostic=True."
+            )
+            predictions = np.hstack(
+                (
+                    self.xyxy,
+                    self.confidence.reshape(-1, 1),
+                    self.class_id.reshape(-1, 1),
+                )
+            )
+
+        if self.mask is not None:
+            indices = mask_non_max_suppression(
+                predictions=predictions, masks=self.mask, iou_threshold=threshold
+            )
+        else:
+            indices = box_non_max_suppression(
                 predictions=predictions, iou_threshold=threshold
             )
-            return self[indices]
 
-        assert self.class_id is not None, (
-            "Detections class_id must be given for NMS to be executed. If you intended"
-            " to perform class agnostic NMS set class_agnostic=True."
-        )
-
-        predictions = np.hstack(
-            (self.xyxy, self.confidence.reshape(-1, 1), self.class_id.reshape(-1, 1))
-        )
-        indices = non_max_suppression(predictions=predictions, iou_threshold=threshold)
         return self[indices]
